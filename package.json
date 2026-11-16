@@ -1,0 +1,65 @@
+{
+  "name": "@ruchonggithub/dsh-quota-usage",
+  "version": "0.1.0",
+  "description": "A DeepSeek Harness sidebar plugin: the active provider's account balance, channel credits or subscription quota, that model's unit prices, and per-provider / per-model usage statistics.",
+  "type": "module",
+  "main": "lib/index.js",
+  "icon": "./icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruchonggithub/dsh-quota-usage.git"
+  },
+  "homepage": "https://github.com/ruchonggithub/dsh-quota-usage",
+  "bugs": {
+    "url": "https://github.com/ruchonggithub/dsh-quota-usage/issues"
+  },
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "files": [
+    "lib",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web",
+      "immediately": false
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-credentials": "^0.1.0-rc.6 || ^0.2.0-rc.1 || ^0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek",
+    "deepseek-harness",
+    "plugin",
+    "usage",
+    "balance",
+    "quota",
+    "credits",
+    "subscription",
+    "tokens",
+    "web"
+  ]
+}

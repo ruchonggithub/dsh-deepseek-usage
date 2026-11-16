@@ -1,0 +1,17 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- dsh-quota-usage：余额 ¥ 硬币。
+       硬币与 ¥ 就是卡片上放大的余额读数——侧边栏宽态下卡片显示的全部内容。
+       峰谷指示灯（原来的绿色圆点）已按用户要求从界面上整块去掉，图标里也一并删除，
+       避免图标承诺一个界面上并不存在的东西。 -->
+  <defs>
+    <linearGradient id="coin" x1="7" y1="9" x2="27" y2="30" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#69B9FF"/>
+      <stop offset="1" stop-color="#324DE2"/>
+    </linearGradient>
+  </defs>
+  <circle cx="18" cy="18" r="13" stroke="url(#coin)" stroke-width="2.1"/>
+  <path d="M12.4 10.6 18 16.7 23.6 10.6" stroke="url(#coin)" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M18 16.7V25.4" stroke="url(#coin)" stroke-width="2.1" stroke-linecap="round"/>
+  <path d="M13.2 19.5H22.8" stroke="url(#coin)" stroke-width="2.1" stroke-linecap="round"/>
+  <path d="M13.2 23H22.8" stroke="url(#coin)" stroke-width="2.1" stroke-linecap="round"/>
+</svg>

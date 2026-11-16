@@ -1,0 +1,6 @@
+# dsh-quota-usage — 额度与用量侧边栏插件（npm 包名 @ruchonggithub/dsh-quota-usage）。
+# Host 半注册 /api/quota-usage/* 路由；包声明 dsh.client 提供浏览器侧边栏卡片。
+# `id` 是 Loader 行 id，浏览器半部按它取 configForms 控制器，改名会让设置页读不到配置。
+- insert:
+    - id: quota-usage
+      name: '@ruchonggithub/dsh-quota-usage'

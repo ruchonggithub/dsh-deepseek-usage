@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Quota & Usage",
+    "description": "Shows the balance, credits or subscription quota behind the active model, that model's current unit prices, and per-provider / per-model usage by billing type in the DSH sidebar.",
+    "detail": "README.md"
+  }
+}
