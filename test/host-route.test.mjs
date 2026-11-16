@@ -1157,3 +1157,99 @@ test('stats：会话目录不存在时返回空统计而不是 5xx', async () =>
     rmSync(emptyHome, { recursive: true, force: true });
   }
 });
+
+// ---- /api/quota-usage?session=：按会话解析"当前模型" -----------------------
+//
+// 用户报的 bug：「切换会话后如果另一个会话的大模型不同，面板还是没有自动把当前大
+// 模型的标记改到刚切过去的会话的大模型那里」。
+//
+// 根因：`agentDefaultModel.currentSelection()` 是**全局默认选择**，与会话无关。
+// 会话级模型只在客户端投影与会话日志里，宿主 ctx 拿不到——所以路由按会话日志回放。
+//
+// 回落链（顺序是契约）：会话级 → 全局默认选择 → DEFAULT_MODEL。
+
+/** 在临时 DSH_HOME 里铺**两个**不同模型的会话，返回 {home, cleanup}。 */
+function makeTwoSessionHome() {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-usage-two-'));
+  const seed = (sessionId, events) => {
+    const dir = join(home, 'sessions', '--ws--', sessionId);
+    mkdirSync(dir, { recursive: true });
+    const body = events.map((e) => JSON.stringify(e)).join('\n');
+    writeFileSync(join(dir, 'session.v4.jsonl.zstd'), zlib.zstdCompressSync(Buffer.from(body, 'utf8')));
+  };
+  // 会话 A：用户手动切到了 trae（model/selection 事件）。
+  seed('session-trae', [
+    { type: 'model/selection', seq: 5, time: 5, data: { provider: 'trae', model: 'deepseek-v4.1-flash' } },
+  ]);
+  // 会话 B：从没手动切过模型，但发过请求（request/header + assistant/message）。
+  seed('session-buddy', [
+    { type: 'request/header', seq: 1, time: 1, data: { header: { config: { provider: 'buddy', model: 'deepseek-v4.1-flash' } } } },
+    assistantEvent('m1', 'buddy', 'deepseek-v4.1-flash', { inputTokens: 10, totalTokens: 10 }),
+  ]);
+  return { home, cleanup: () => rmSync(home, { recursive: true, force: true }) };
+}
+
+test('session 参数：两个用不同模型的会话必须返回不同的 provider/model', async () => {
+  const { home, cleanup } = makeTwoSessionHome();
+  const prevHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const { ctx, routes } = makeCtx({ provider: 'deepseek-official', model: 'deepseek-flash' });
+    apply(ctx);
+    const route = routes.get('/api/quota-usage');
+    const a = await call(route, makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage?lang=zh&session=session-trae'));
+    const b = await call(route, makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage?lang=zh&session=session-buddy'));
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    assert.equal(a.body.provider.id, 'trae', `会话 A 应给出 trae，实际 ${JSON.stringify(a.body.provider)}`);
+    assert.equal(b.body.provider.id, 'buddy', `会话 B 应给出 buddy，实际 ${JSON.stringify(b.body.provider)}`);
+    assert.notEqual(a.body.provider.id, b.body.provider.id, '**两个会话的当前模型必须不同**');
+    assert.equal(a.body.pricing.modelFrom, 'session');
+    assert.equal(b.body.pricing.modelFrom, 'session');
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+    cleanup();
+  }
+});
+
+test('session 参数：没有该会话时回落到 agentDefaultModel（不报错、不变空）', async () => {
+  const { home, cleanup } = makeTwoSessionHome();
+  const prevHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const { ctx, routes } = makeCtx({ provider: 'deepseek-official', model: 'deepseek-flash' });
+    apply(ctx);
+    const route = routes.get('/api/quota-usage');
+    const res = await call(route, makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage?lang=zh&session=session-nope'));
+    assert.equal(res.status, 200);
+    assert.equal(res.body.provider.id, 'deepseek-official', `应回落到全局默认，实际 ${JSON.stringify(res.body.provider)}`);
+    assert.equal(res.body.tier.model, 'deepseek-flash');
+    assert.equal(res.body.pricing.modelFrom, 'default-selection');
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+    cleanup();
+  }
+});
+
+test('无 session 参数：行为与改造前一致（只用 agentDefaultModel）', async () => {
+  const { ctx, routes } = makeCtx({ provider: 'deepseek-official', model: 'deepseek-flash' });
+  apply(ctx);
+  const res = await call(routes.get('/api/quota-usage'), makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage?lang=zh'));
+  assert.equal(res.status, 200);
+  assert.equal(res.body.provider.id, 'deepseek-official');
+  assert.equal(res.body.pricing.modelFrom, 'default-selection');
+});
+
+test('session 参数：非法会话 id 被忽略（不拼进路径、不报错）', async () => {
+  const { ctx, routes } = makeCtx({ provider: 'deepseek-official', model: 'deepseek-flash' });
+  apply(ctx);
+  const route = routes.get('/api/quota-usage');
+  for (const bad of ['../../etc/passwd', 'a/b', '..', '.']) {
+    const res = await call(
+      route,
+      makeReq({ host: '127.0.0.1:64452' }, `/api/quota-usage?lang=zh&session=${encodeURIComponent(bad)}`),
+    );
+    assert.equal(res.status, 200, `${bad} 不应导致 5xx`);
+    assert.equal(res.body.pricing.modelFrom, 'default-selection', `${bad} 应被忽略`);
+  }
+});

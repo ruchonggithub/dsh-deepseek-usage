@@ -19,6 +19,8 @@ import {
   readSessionEvents,
   decompressZstdFrames,
   createUsageScanner,
+  createSessionModelResolver,
+  lastModelOf,
   sessionsRoot,
 } from '../lib/usage.js';
 
@@ -345,6 +347,128 @@ test('扫描器：scanSession 只统计该会话，与全机统计分开缓存',
     assert.equal(single.totalTokens ?? single.kinds[0].totalTokens, 10);
     assert.equal(single.sessionId, 'session-one');
     assert.equal(single.files, 1);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---- 会话级模型：从日志回放"这个会话最后用的是哪个模型" ---------------------
+//
+// 背景（用户报的 bug）：「切换会话后如果另一个会话的大模型不同，面板还是没有自动
+// 把当前大模型的标记改到刚切过去的会话的大模型那里」。
+//
+// 根因：宿主 `agentDefaultModel.currentSelection()` 是**全局默认选择**，与会话无关。
+// 会话级模型只在客户端投影与会话日志里，宿主 ctx 拿不到——所以服务端从日志读。
+//
+// 本机 66 个会话的实测事实（决定了下面判据的形状）：
+//   · `model/selection` 只有 13/66 有（只在手动切过模型的会话里写）；
+//   · `request/header` 与 `assistant/message` 几乎每个会话都有；
+//   · 三者的末值**互相一致**，所以取 seq 最大的那条即可，不需要定优先级。
+
+/** 造一条 model/selection 事件（用户手动切模型时宿主写的）。 */
+function selection({ provider, model, seq }) {
+  return { type: 'model/selection', seq, time: seq, data: { provider, model } };
+}
+
+/** 造一条 request/header 事件（每次模型请求都写）。 */
+function requestHeader({ provider, model, seq }) {
+  return { type: 'request/header', seq, time: seq, data: { header: { config: { provider, model } } } };
+}
+
+test('lastModelOf：三类候选都能读出模型，取 seq 最大的那条', () => {
+  // 只有 selection：切过模型的会话就是这种形状。
+  assert.deepEqual(
+    lastModelOf([selection({ provider: 'trae', model: 'deepseek-v4.1-flash', seq: 5 })]),
+    { provider: 'trae', model: 'deepseek-v4.1-flash', from: 'model/selection' },
+  );
+  // 只有 request/header（没有手动切过模型）：这只占多数。
+  assert.deepEqual(
+    lastModelOf([requestHeader({ provider: 'buddy', model: 'deepseek-v4.1-flash', seq: 7 })]),
+    { provider: 'buddy', model: 'deepseek-v4.1-flash', from: 'request/header' },
+  );
+  // 只有 assistant/message：
+  assert.deepEqual(
+    lastModelOf([message({ id: 'a', provider: 'minimax', model: 'MiniMax-M3.1-Flash', usage: { inputTokens: 1 } })]),
+    { provider: 'minimax', model: 'MiniMax-M3.1-Flash', from: 'assistant/message' },
+  );
+});
+
+test('lastModelOf：三类混在一起时按 seq 取最后写入的那一个', () => {
+  const events = [
+    requestHeader({ provider: 'trae', model: 'deepseek-v4.1-flash', seq: 10 }),
+    selection({ provider: 'codex-chatgpt', model: 'gpt-6.1-sol', seq: 20 }),
+    // 切到 codex 之后又发了一次请求：request/header 更晚，它才是"现在用的"
+    requestHeader({ provider: 'codex-chatgpt', model: 'gpt-6.1-sol', seq: 30 }),
+    selection({ provider: 'trae', model: 'deepseek-v4.1-flash', seq: 40 }),
+  ];
+  assert.deepEqual(lastModelOf(events), { provider: 'trae', model: 'deepseek-v4.1-flash', from: 'model/selection' });
+});
+
+test('lastModelOf：形状不对一律当没有（返回 null，不猜）', () => {
+  assert.equal(lastModelOf([]), null);
+  assert.equal(lastModelOf(null), null);
+  assert.equal(lastModelOf([{ type: 'model/selection', seq: 1, data: {} }]), null);
+  assert.equal(lastModelOf([{ type: 'request/header', seq: 1, data: { header: {} } }]), null);
+  assert.equal(lastModelOf([{ type: 'assistant/message', seq: 1, data: { message: {} } }]), null);
+  // 不相关的类型不参与。
+  assert.equal(lastModelOf([{ type: 'user/message', seq: 1, data: { provider: 'x', model: 'y' } }]), null);
+});
+
+test('会话模型解析器：不同会话返回各自的模型（本次修复的核心断言）', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-model-home-'));
+  try {
+    const one = join(sessionsRoot(home), '--ws--', 'session-trae');
+    const two = join(sessionsRoot(home), '--ws--', 'session-buddy');
+    mkdirSync(one, { recursive: true });
+    mkdirSync(two, { recursive: true });
+    const lines = (events) => zlib.zstdCompressSync(Buffer.from(events.map((e) => JSON.stringify(e)).join('\n'), 'utf8'));
+    writeFileSync(join(one, 'session.v4.jsonl.zstd'), lines([
+      selection({ provider: 'trae', model: 'deepseek-v4.1-flash', seq: 1 }),
+    ]));
+    writeFileSync(join(two, 'session.v4.jsonl.zstd'), lines([
+      requestHeader({ provider: 'buddy', model: 'deepseek-v4.1-flash', seq: 3 }),
+    ]));
+
+    const resolver = createSessionModelResolver({ home });
+    const a = await resolver.resolve('session-trae');
+    const b = await resolver.resolve('session-buddy');
+    assert.equal(a.provider, 'trae', `会话 A 应给出 trae，实际 ${JSON.stringify(a)}`);
+    assert.equal(b.provider, 'buddy', `会话 B 应给出 buddy，实际 ${JSON.stringify(b)}`);
+    assert.notEqual(a.provider, b.provider, '**两个用不同模型的会话必须给出不同的 provider**');
+
+    // 不存在的会话：null（调用方回落全局默认，不能凭空编一个）
+    assert.equal(await resolver.resolve('session-nope'), null);
+    assert.equal(await resolver.resolve(''), null);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('会话模型解析器：日志未变时结果稳定，追加后必须重算', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-model-cache-'));
+  try {
+    const dir = join(sessionsRoot(home), '--ws--', 'session-one');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'session.v4.jsonl.zstd');
+    const first = [selection({ provider: 'trae', model: 'deepseek-v4.1-flash', seq: 1 })];
+    writeFileSync(file, zlib.zstdCompressSync(Buffer.from(first.map((e) => JSON.stringify(e)).join('\n'), 'utf8')));
+
+    const resolver = createSessionModelResolver({ home });
+    assert.equal((await resolver.resolve('session-one')).provider, 'trae');
+    // 同一份日志再问一次：仍是同一个答案（缓存命中时不会读盘，结果当然也不变）。
+    assert.equal((await resolver.resolve('session-one')).provider, 'trae');
+
+    // 追加一条新的选择：**缓存必须失效**，否则用户切了模型、面板却永远停在旧值上。
+    const next = [
+      ...first,
+      selection({ provider: 'codex-chatgpt', model: 'gpt-6.1-sol', seq: 2 }),
+    ];
+    writeFileSync(file, zlib.zstdCompressSync(Buffer.from(next.map((e) => JSON.stringify(e)).join('\n'), 'utf8')));
+    assert.equal((await resolver.resolve('session-one')).provider, 'codex-chatgpt', '日志变了必须重算');
+
+    // 日志没了：返回 null（让调用方回落），不是把缓存里的旧模型端出来当现状。
+    rmSync(file);
+    assert.equal(await resolver.resolve('session-one'), null, '会话日志已不存在时不得返回旧值');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

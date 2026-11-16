@@ -818,8 +818,17 @@ const SAMPLE_SUBSCRIPTION = {
   skipped: [],
 };
 
-/** 渲染并可选展开（同一实例，避免模块级状态丢失）。 */
-async function renderG(fetchImpl, { expand = false } = {}) {
+/**
+ * 渲染并把卡片摆到指定的展开态。
+ *
+ * **展开是默认态**（`creditCardOpen = true`）：采集器已经把订阅 / 充值 / 积分三类
+ * 采到了，让用户再多点一次才看得见是多余的。
+ *
+ * 但 `creditCardOpen` 是**模块级开关**，在同一次验收运行里会被前面的用例改掉，
+ * 所以这里不能"点一下就当展开/折叠"——那会随上一条用例的残留状态翻转。改成先渲染、
+ * 读头部箭头（`▾` 展开 / `▸` 折叠），与目标不一致才点一次，点完再确认。
+ */
+async function renderG(fetchImpl, { expand = true } = {}) {
   const { slots, render } = loadClient();
   const entry = slots['sidebar.footer.action'];
   expect(entry !== undefined, '卡片未注册');
@@ -827,19 +836,27 @@ async function renderG(fetchImpl, { expand = false } = {}) {
   const element = entry.comp({ wide: true, ctx: undefined });
   render(element);
   await flush();
-  const settled = render(element);
-  if (!expand) return settled;
-  const head = nodesOf(settled).filter((n) => n.props && typeof n.props.onClick === 'function' && n.props.role === 'button');
-  expect(head.length > 0, '需要 role=button 的头部来展开');
-  head[0].props.onClick();
-  await flush();
-  return render(element);
+  let out = render(element);
+  const isOpen = () => textOf(out).includes('▾');
+  // 最多点两次：正常情况下一次就到位；两次是给"残留状态与目标只差一次翻转"兜底。
+  for (let i = 0; i < 2 && isOpen() !== expand; i += 1) {
+    const head = nodesOf(out).filter((n) => n.props && typeof n.props.onClick === 'function' && n.props.role === 'button');
+    expect(head.length > 0, '需要 role=button 的头部来切换展开态');
+    head[0].props.onClick();
+    await flush();
+    out = render(element);
+  }
+  expect(isOpen() === expand, `卡片未能摆到${expand ? '展开' : '折叠'}态：${textOf(out)}`);
+  return out;
 }
 
 async function groupG() {
   // G1 折叠态一行摘要，无标题
+  //
+  // 注意：**展开是默认态**（三类数据采集到了就该直接看见）。这条判据考的是"折叠
+  // 之后长什么样"，所以显式要求折叠态，而不是依赖默认值。
   await claim('G1', '折叠态是一行摘要，字号 ≤13px，且不显示卡片标题', async () => {
-    const out = await renderG(fetchThreeKinds({ credits: SAMPLE_CREDITS }));
+    const out = await renderG(fetchThreeKinds({ credits: SAMPLE_CREDITS }), { expand: false });
     const styled = stylesOf(out).filter(({ text }) => text !== '');
     const bigNumbers = styled.filter(({ text, style }) => {
       const size = Number.parseInt(String(style.fontSize ?? ''), 10);

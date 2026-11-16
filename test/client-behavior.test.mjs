@@ -147,6 +147,29 @@ function renderCard(Comp, runtime, props = { wide: true }) {
 }
 
 /**
+ * 造一个宿主风格的 `useSessions` 选择器（root 标准 props）。
+ *
+ * 形状照着宿主来：`SessionListState = { ids, byId, phase }`，`byId[id].retainedBy.mainView`
+ * 是"这个会话正被主面板持有"的计数——切会话时它在两个会话之间转移。测试用它断言
+ * 「卡片会跟着当前会话走」。
+ *
+ * @param {{current: string}} box 可变的当前会话（模拟用户切会话）
+ */
+function makeSessionsHook(box) {
+  const sessions = {
+    'session-a': { id: 'session-a', retainedBy: { mainView: 0 } },
+    'session-b': { id: 'session-b', retainedBy: { mainView: 0 } },
+  };
+  const stateOf = () => {
+    for (const key of Object.keys(sessions)) {
+      sessions[key].retainedBy.mainView = sessions[key].id === box.current ? 1 : 0;
+    }
+    return { ids: Object.keys(sessions), byId: sessions, phase: 'ready' };
+  };
+  return (selector) => selector(stateOf());
+}
+
+/**
  * 递归展开函数组件（含包裹层的子组件），统一在一次 runtime.render 里执行。
  * 迷你 React 的 hook 槽位是全局游标，展开顺序固定，因此重渲染时各组件状态仍落在
  * 同一批槽位上——足以覆盖「映射编辑器 + 令牌区」这种一个槽位里嵌两个组件的结构。
@@ -1218,8 +1241,9 @@ function channelWithoutTotal(channel, remaining, extra = {}) {
 /**
  * 让卡片停在展开态并渲染。
  *
- * 头部那个 role="button" 的 onClick 就是 setOpen 的入口（默认折叠），点一次即可
- * 展开；再渲染一次让新状态生效。
+ * 展开态默认就是**开**（`creditCardOpen = true`：采集器已经采到三类数据，再让用户
+ * 多点一次才看得见是多余的）。所以这里不再"点一下就展开"——那样在新默认下反而会
+ * 把它合起来。函数保留：它同时把头部断言留在原地，并保证渲染两次以跑完取数。
  */
 async function renderExpanded(Comp, runtime, snapshotBody) {
   globalThis.fetch = async (url) => {
@@ -1244,11 +1268,9 @@ async function renderExpanded(Comp, runtime, snapshotBody) {
   };
   renderCard(Comp, runtime);
   await flush();
-  // 展开：点头部（role=button）切换 creditCardOpen，再渲染让状态生效。
+  // 首屏即展开：头部那个 role="button" 仍然存在（可以点回合起来），但不需要点。
   const header = nodesOf(renderCard(Comp, runtime).out).find((n) => n.props && n.props.role === 'button');
-  assert.ok(header, '卡片头部应可作为展开开关');
-  header.props.onClick();
-  await flush();
+  assert.ok(header, '卡片头部应可作为展开/折叠开关');
   return renderCard(Comp, runtime).out;
 }
 
@@ -1531,4 +1553,272 @@ test('用量页：workspace 口径按 {workspaces:[...]} 解包，全选时出�
   assert.ok(text.includes('alpha'), '工作区行必须出现（响应体是 {workspaces:[...]}，不是裸数组）：' + text);
   assert.ok(text.includes('s9'), '工作区下的会话行必须出现：' + text);
   assert.ok(text.includes('stats.tree.machine'), '整机根行在：' + text);
+});
+
+// ---- 三类采集数据与「当前模型类型」无关 -------------------------------------
+//
+// 用户原话：「那你这个不是多余判断吗，我面板上什么都有，你留着只查官方余额的判断是
+// 干嘛？项目代码彻查哪里还有这种画蛇添足的操作。」
+//
+// 根因：卡片曾经写成 `if (kind0 === 'none' && hasCardData)` —— `kind0` 是**当前
+// 会话所用 provider 的类型**。于是同一台机器、同一份采集数据，只因为当前对话用的是
+// 官方余额模型（kind='balance'）而不是免费渠道（kind='none'），界面就从"三大类"
+// 退化成"一张余额卡"。
+//
+// 下面的判据钉住两件事：
+//   1. balance 型模型下三类数据也全部显示；
+//   2. balance 型与 none 型的**渲染结构完全一致**（除了数字本身）。
+
+const THREE_KINDS_SNAPSHOT = {
+  ok: true,
+  snapshots: {
+    credits: {
+      value: {
+        available: true,
+        currentChannel: 'trae',
+        channels: [
+          { channel: 'trae', state: 'ok', remaining: 5069.03, total: 7400, percent: 68.5, unit: 'credits' },
+        ],
+      },
+      updatedAt: Date.now(),
+      stale: false,
+    },
+    prepaid: {
+      value: {
+        providers: [
+          {
+            provider: 'openrouter', displayName: 'OpenRouter', kind: 'balance',
+            balance: { isAvailable: true, total: 12.5, currency: 'USD', used: 7.5 },
+            ok: true, code: null,
+          },
+        ],
+      },
+      updatedAt: Date.now(),
+      stale: false,
+    },
+    subscription: {
+      value: {
+        subscriptions: [
+          {
+            ok: true, mode: 'plugin', provider: 'openai-codex', displayName: 'OpenAI Codex',
+            plan: 'plus', accounts: [{ id: 'a1', alias: 'alice@example.com', plan: 'plus', active: true, windows: [{ key: '5h', percent: 13, resetsAt: null }] }],
+          },
+        ],
+      },
+      updatedAt: Date.now(),
+      stale: false,
+    },
+  },
+};
+
+/** 造一个宿主响应：provider.kind 由用例指定（balance / none）。 */
+function providerKindResponse(kind) {
+  if (kind === 'balance') {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        provider: { id: 'deepseek-official', displayName: 'DeepSeek', kind: 'balance', reason: null },
+        balance: { isAvailable: true, total: 6970.17, currency: 'CNY' },
+        usage: null,
+        tier: { input: 2, cacheRead: 0.04, output: 8, known: true, currency: 'CNY', window: 'idle' },
+        next: { peak: false, at: null, ms: 0 },
+        peak: false,
+        updatedAt: Date.now(),
+        errors: [],
+      }),
+    };
+  }
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      ok: true,
+      provider: { id: 'buddy', displayName: 'buddy', kind: 'none', reason: 'unsupported', via: 'none' },
+      balance: { isAvailable: null, total: null, currency: null },
+      usage: null,
+      tier: { input: null, cacheRead: null, cacheWrite: null, output: null, known: false, currency: 'CNY', window: null },
+      next: { peak: false, at: null, ms: 0 },
+      peak: false,
+      updatedAt: Date.now(),
+      errors: [],
+    }),
+  };
+}
+
+/** 用指定 kind 渲染一次卡片（三类数据都有）。 */
+async function renderWithKind(kind) {
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.startsWith('/api/quota-usage/snapshot')) {
+      return { ok: true, status: 200, json: async () => THREE_KINDS_SNAPSHOT };
+    }
+    return providerKindResponse(kind);
+  };
+  const runtime = makeRuntime();
+  const Comp = loadClient(runtime);
+  renderCard(Comp, runtime);
+  await flush();
+  return renderCard(Comp, runtime).out;
+}
+
+test('当前模型是 balance 型时，三类采集数据也必须全部显示（不再只有余额卡）', async () => {
+  const text = textOf(await renderWithKind('balance'));
+  // 订阅 / 充值 / 积分 三个分区标题都要在。
+  assert.ok(text.includes('订阅'), `balance 型也应显示「订阅」分区，实际：${text}`);
+  assert.ok(text.includes('充值'), `balance 型也应显示「充值」分区，实际：${text}`);
+  assert.ok(text.includes('积分'), `balance 型也应显示「积分」分区，实际：${text}`);
+  // 三类各有一个可辨识的数字。
+  assert.ok(/Codex/i.test(text), `应出现订阅来源，实际：${text}`);
+  assert.ok(/OpenRouter/i.test(text), `应出现充值来源，实际：${text}`);
+  assert.ok(text.includes('7400') || text.includes('7.4K'), `应出现积分总量，实际：${text}`);
+});
+
+test('balance 型与 none 型的渲染结构一致（用户抱怨的根源就在这里）', async () => {
+  const balanceText = textOf(await renderWithKind('balance'));
+  const noneText = textOf(await renderWithKind('none'));
+  // 两个分区标题集合必须相同：同一份采集数据，界面不该因为当前模型不同而换一套。
+  for (const title of ['订阅', '充值', '积分']) {
+    assert.equal(balanceText.includes(title), noneText.includes(title),
+      `「${title}」分区在两种 kind 下必须一致：balance=${balanceText.includes(title)} none=${noneText.includes(title)}`);
+  }
+  // 分区顺序也必须一致。
+  const order = (t) => ['订阅', '充值', '积分'].map((s) => t.indexOf(s));
+  const balanceOrder = order(balanceText).map((i) => (i >= 0 ? 1 : 0));
+  const noneOrder = order(noneText).map((i) => (i >= 0 ? 1 : 0));
+  assert.deepEqual(balanceOrder, noneOrder, `两种 kind 的分区出现情况必须一致：${balanceText} ||| ${noneText}`);
+  assert.deepEqual(balanceOrder, [1, 1, 1], '三类分区都应出现');
+});
+
+test('只有余额数据时仍然显示三大类卡片（有积分渠道那一类），且不出现余额型的大数字', async () => {
+  // 这台机器只采到了积分一类：订阅与充值都空。
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.startsWith('/api/quota-usage/snapshot')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          snapshots: {
+            credits: {
+              value: { available: true, channels: [{ channel: 'trae', state: 'ok', remaining: 5069.03, total: 7400, percent: 68.5, unit: 'credits' }] },
+              updatedAt: Date.now(),
+              stale: false,
+            },
+          },
+        }),
+      };
+    }
+    return providerKindResponse('balance');
+  };
+  const runtime = makeRuntime();
+  const Comp = loadClient(runtime);
+  renderCard(Comp, runtime);
+  await flush();
+  const text = textOf(renderCard(Comp, runtime).out);
+  // 有数据的分区照常渲染；没有的分区（订阅 / 充值）不占位。
+  assert.ok(text.includes('积分'), `有积分数据时应显示积分分区，实际：${text}`);
+  assert.ok(!text.includes('订阅'), `没有订阅数据时不应出现订阅标题，实际：${text}`);
+  assert.ok(!text.includes('充值'), `没有充值数据时不应出现充值标题，实际：${text}`);
+  assert.ok(text.includes('5069') || text.includes('7400'), `应显示积分读数，实际：${text}`);
+});
+
+test('三类都没有数据时：卡片是余额形态（不空白）', async () => {
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.startsWith('/api/quota-usage/snapshot')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, snapshots: {} }) };
+    }
+    return providerKindResponse('balance');
+  };
+  const runtime = makeRuntime();
+  const Comp = loadClient(runtime);
+  renderCard(Comp, runtime);
+  await flush();
+  const text = textOf(renderCard(Comp, runtime).out);
+  // 余额卡兜底：金额照常显示，不是空白，也不出现三个空分区。
+  assert.ok(text.includes('6970.17'), `三类都没数据时应显示余额，实际：${text}`);
+  assert.ok(!text.includes('订阅'), `没有数据时不应出现订阅分区，实际：${text}`);
+  assert.ok(!text.includes('充值'), `没有数据时不应出现充值分区，实际：${text}`);
+});
+
+// ---- 切换会话：请求必须带上当前会话 id，并在切换后重新取数 ---------------
+//
+// 用户报的 bug：「切换会话后如果另一个会话的大模型不同，面板还是没有自动把当前大模型
+// 的标记改到刚切过去的会话的大模型那里」。
+//
+// 客户端要做两件事，缺一不可：
+//   1. 请求里带 `?session=`（否则服务端只能回落全局默认，永远返回旧模型）；
+//   2. 会话 id 变化时重新取数（否则界面停在上一个会话的读数上）。
+
+test('当前会话 id 会被拼进 /api/quota-usage 的 session 参数', async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    calls.push(target);
+    if (target.startsWith('/api/quota-usage/snapshot')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, snapshots: {} }) };
+    }
+    return providerKindResponse('balance');
+  };
+  const runtime = makeRuntime();
+  const Comp = loadClient(runtime);
+  const box = { current: 'session-a' };
+  const useSessions = makeSessionsHook(box);
+  renderCard(Comp, runtime, { wide: true, useSessions });
+  await flush();
+  const usage = calls.filter((u) => u.startsWith('/api/quota-usage?'));
+  assert.equal(usage.length, 1, `挂载后应发一次余额请求，实际 ${usage.join(', ')}`);
+  assert.ok(usage[0].includes('session=session-a'), `请求必须带上当前会话 id，实际：${usage[0]}`);
+});
+
+test('切换会话后重新取数，且请求带的是新会话的 id', async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    calls.push(target);
+    if (target.startsWith('/api/quota-usage/snapshot')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, snapshots: {} }) };
+    }
+    return providerKindResponse('balance');
+  };
+  const runtime = makeRuntime();
+  const Comp = loadClient(runtime);
+  const box = { current: 'session-a' };
+  const useSessions = makeSessionsHook(box);
+  renderCard(Comp, runtime, { wide: true, useSessions });
+  await flush();
+  const before = calls.filter((u) => u.startsWith('/api/quota-usage?')).length;
+
+  // 用户切到另一个会话（mainView 转移）。
+  box.current = 'session-b';
+  renderCard(Comp, runtime, { wide: true, useSessions });
+  await flush();
+
+  const usage = calls.filter((u) => u.startsWith('/api/quota-usage?'));
+  assert.ok(usage.length > before, `切会话后必须重新取数，实际 ${usage.length} 次（切前 ${before}）`);
+  const last = usage[usage.length - 1];
+  assert.ok(last.includes('session=session-b'), `重取时必须带新会话 id，实际：${last}`);
+});
+
+test('宿主没提供 useSessions 时不带 session 参数（旧宿主兼容）', async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    calls.push(target);
+    if (target.startsWith('/api/quota-usage/snapshot')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, snapshots: {} }) };
+    }
+    return providerKindResponse('balance');
+  };
+  const runtime = makeRuntime();
+  const Comp = loadClient(runtime);
+  renderCard(Comp, runtime); // 不给 useSessions
+  await flush();
+  const usage = calls.filter((u) => u.startsWith('/api/quota-usage?'));
+  assert.equal(usage.length, 1);
+  assert.ok(!usage[0].includes('session='), `没有会话 id 时不应带空参数，实际：${usage[0]}`);
+  assert.ok(usage[0].includes('lang='), `语言参数照旧要带，实际：${usage[0]}`);
 });
