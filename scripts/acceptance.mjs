@@ -900,33 +900,53 @@ async function groupG() {
 
   // G3 三大类分区顺序
   //
-  // 原判据用 `text.indexOf('积分')` 定位分区，但折叠摘要里有「… / 7400 积分」这个单位，
-  // indexOf 会命中单位而不是分区标题，导致"充值@52 < 积分@18"必红——判据本身有问题。
-  // 这里改成按**分区标题节点**定位：分区标题是短文本块，且不带数字。
+  // 定位方式换过两次，两次都是**判据自己的错**，记在这里免得再犯：
+  //   1. `text.indexOf('积分')` —— 折叠摘要里有「… / 7400 积分」这个**单位**，
+  //      indexOf 命中的是单位不是标题，于是"充值@52 < 积分@18"必红；
+  //   2. 按"文本恰好等于分区名的节点"收集 —— 顶部当前行里那个单位 span 的文本
+  //      也正好是「积分」，每个积分渠道行的单位 span 也是「积分」。于是收出
+  //      `积分 → 订阅 → 充值 → 积分 → 积分 → 积分`，顺序断言被挤乱。
+  //
+  // 两次的根因是同一个：**拿文本当结构**。文本里同时存在"分区标题"和"单位"，
+  // 两者的字面都可能是「积分」，靠字符串永远分不开。
+  //
+  // 现在按**公开语义**定位：分区标题必须是 `role="heading"`。这样
+  //   · 与「单位」彻底分得开（单位是普通 span，没有 heading 语义）；
+  //   · 屏幕阅读器也能把三类读成一组分区标题（此前是裸 div，读不出层级）；
+  //   · 断言仍然是"订阅 → 充值 → 积分 的顺序"，不 sort、不 substring。
+  // 拿不到 heading 时**报红**，不退回到按文本猜——那正是前两次假绿的来源。
   await claim('G3', '展开态按 订阅 → 充值 → 积分 分区', async () => {
     const out = await renderG(
       fetchThreeKinds({ credits: SAMPLE_CREDITS, prepaid: SAMPLE_PREPAID, subscription: SAMPLE_SUBSCRIPTION }),
       { expand: true },
     );
-    // 收集所有"纯标题"文本（恰好等于分区名，不含数字），按出现顺序排列
-    const titles = [];
+    const headingTitles = [];
     const walk = (node) => {
       if (node === null || node === undefined || typeof node !== 'object') return;
       if (Array.isArray(node)) { for (const c of node) walk(c); return; }
-      const t = textOf(node).trim();
-      if (['订阅', '充值', '积分'].includes(t)) titles.push(t);
+      const props = node.props ?? {};
+      // 只收**公开语义上的标题**。`aria-level` 一并要求：没有层级的 heading
+      // 在辅助技术里等于没有结构，正是我们要根治的那种"看着像标题"。
+      if (props.role === 'heading' && typeof props['aria-level'] === 'number') {
+        headingTitles.push(textOf(node).trim());
+      }
       if (Array.isArray(node.children)) for (const c of node.children) walk(c);
     };
     walk(out);
-    expect(titles.includes('订阅'), `展开态应出现「订阅」分区标题，实际标题：${titles.join(',')} || 全文：${textOf(out)}`);
-    expect(titles.includes('充值'), `展开态应出现「充值」分区标题，实际标题：${titles.join(',')}`);
-    expect(titles.includes('积分'), `展开态应出现「积分」分区标题，实际标题：${titles.join(',')}`);
-    // 顺序：订阅 在 充值 之前，充值 在 积分 之前
-    const iSub = titles.indexOf('订阅');
-    const iPre = titles.indexOf('充值');
-    const iCre = titles.indexOf('积分');
-    expect(iSub < iPre, `顺序必须是 订阅 → 充值，实际 ${titles.join(' → ')}`);
-    expect(iPre < iCre, `顺序必须是 充值 → 积分，实际 ${titles.join(' → ')}`);
+    expect(headingTitles.length > 0,
+      `分区标题必须有 role="heading" + aria-level（否则"标题"与"单位"只能靠字面区分，`
+      + `判据又会退回按文本猜）。实际标题节点：${JSON.stringify(headingTitles)} || 全文：${textOf(out)}`);
+    // 顺序断言：按**节点出现顺序**比较，不排序。
+    const want = ['订阅', '充值', '积分'];
+    const got = headingTitles.filter((t) => want.includes(t));
+    for (const title of want) {
+      expect(got.includes(title), `展开态应出现「${title}」分区标题，实际标题：${JSON.stringify(headingTitles)}`);
+    }
+    expect(got.length === want.length,
+      `分区标题应恰好是 ${JSON.stringify(want)}，实际 ${JSON.stringify(headingTitles)}`
+      + '（多出来的多半是单位 span 被误当标题）');
+    expect(got.join(',') === want.join(','),
+      `分区顺序必须是 订阅 → 充值 → 积分，实际 ${got.join(' → ')}`);
     return true;
   });
 

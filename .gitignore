@@ -4,3 +4,5 @@ node_modules/
 *.tgz
 .DS_Store
 Thumbs.db
+# meta-mutate 的工作副本（故意放在工作区内：临时目录属于工作区外，禁写）
+.mutate-work/

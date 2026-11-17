@@ -349,6 +349,28 @@ function makePendingFetch() {
   };
 }
 
+/**
+ * 点**刷新**入口（不是点整卡）。
+ *
+ * 卡片的形态与取数已经拆成两件事（用户口径：「整条当前数据/状态始终切换形态，
+ * 刷新独立 ⟳」）。所以"再取一次数"必须点那个 aria 含「刷新/Refresh」的按钮，
+ * 点整卡只会切形态、不会发请求——这两条行为分别由契约 5 与契约 4 钉住。
+ *
+ * 这里刻意**按 aria 定位真实入口**，不退回"随便找一个 onClick 调用"：那会把
+ * 形态开关当成刷新，等于把这条用例要验的"刷新"验丢了。
+ */
+function clickRefresh(Comp, runtime) {
+  const out = renderCard(Comp, runtime).out;
+  const refresh = nodesOf(out).filter((n) => n.props
+    && typeof n.props.onClick === 'function'
+    && typeof n.props['aria-label'] === 'string'
+    && /刷新|Refresh/i.test(n.props['aria-label']));
+  assert.ok(refresh.length >= 1,
+    `界面上应有独立的刷新入口（aria 含「刷新」），实际可点节点：${JSON.stringify(
+      nodesOf(out).filter((n) => n.props && n.props['aria-label']).map((n) => n.props['aria-label']))}`);
+  refresh[0].props.onClick({ stopPropagation() {} });
+}
+
 test('晚到的旧响应不覆盖新数据', async () => {
   const { usage } = makePendingFetch();
   const runtime = makeRuntime();
@@ -356,8 +378,8 @@ test('晚到的旧响应不覆盖新数据', async () => {
   renderCard(Comp, runtime);
   assert.equal(usage().length, 1, '挂载后应发出一次余额请求');
 
-  renderCard(Comp, runtime).out.props.onClick();
-  assert.equal(usage().length, 2, '点击应发出第二次余额请求');
+  clickRefresh(Comp, runtime);
+  assert.equal(usage().length, 2, '点刷新应发出第二次余额请求');
 
   usage()[1].resolve(okResponse(999));
   await flush();
@@ -374,7 +396,7 @@ test('晚到的旧失败不抹掉新余额', async () => {
   const runtime = makeRuntime();
   const Comp = loadClient(runtime);
   renderCard(Comp, runtime);
-  renderCard(Comp, runtime).out.props.onClick();
+  clickRefresh(Comp, runtime);
   usage()[1].resolve(okResponse(777));
   await flush();
   usage()[0].resolve({ ok: false, status: 500, json: async () => ({ ok: false, message: 'boom' }) });
@@ -421,8 +443,9 @@ test('失败按阶梯补请求；成功一次会取消待发的补请求并复�
   };
   const before = calls.length;
   mode = 'ok';
-  renderCard(Comp, runtime).out.props.onClick();
+  clickRefresh(Comp, runtime);
   await flush();
+  assert.ok(calls.length > before, `点刷新应真实发出请求，实际 ${before} → ${calls.length}`);
   assert.equal(delays.length, 1, `成功后不应再安排补请求，实际 ${delays.join(',')}`);
   assert.ok(cleared.length > 0, '成功后必须清掉待发的补请求定时器');
   globalThis.clearTimeout = realClearTimeout;
@@ -441,7 +464,7 @@ test('一次失败后再成功：错误文案消失，余额显示出来', async
   assert.ok(text.includes('boom'), `失败时应显示错误，实际 ${text}`);
 
   // 再点一次并成功
-  renderCard(Comp, runtime).out.props.onClick();
+  clickRefresh(Comp, runtime);
   usage()[1].resolve(okResponse(6.66));
   await flush();
   text = textOf(renderCard(Comp, runtime).out);
@@ -777,7 +800,16 @@ test('不可查的 provider：没有设置外壳时不显示「去映射」', as
   await flush();
 
   const out = renderCard(Comp, runtime).out;
-  assert.ok(!nodesOf(out).some((n) => n.type === 'button'), '没有设置外壳时不应出现按钮');
+  // 判据只针对**「去映射」这个按钮**：没有设置外壳时点了什么都不会发生，
+  // 所以不画它。不能写成"完全不应有任何 button"——独立刷新 ⟳ 是合法入口
+  // （用户口径：刷新独立于形态，错误态卡片也要能重新取数）。
+  const buttons = nodesOf(out).filter((n) => n.type === 'button');
+  const mapButtons = buttons.filter((n) => /去映射|Set up mapping/.test(textOf(n)));
+  assert.equal(mapButtons.length, 0,
+    `没有设置外壳时不应出现「去映射」按钮，实际按钮：${JSON.stringify(buttons.map(textOf))}`);
+  // 刷新入口必须还在（否则错误态的用户没有任何自救手段）。
+  assert.ok(buttons.some((n) => /刷新|Refresh|⟳/.test(textOf(n)) || /刷新|Refresh/.test(n.props['aria-label'] ?? '')),
+    `错误态仍应有刷新入口，实际按钮：${JSON.stringify(buttons.map((n) => n.props['aria-label'] ?? textOf(n)))}`);
   assert.ok(textOf(out).includes('当前插件不支持 Workbuddy'), '原因文案照旧显示');
 });
 
@@ -926,11 +958,24 @@ test('非 DeepSeek provider 的按量计费模型：显示单价行，全天一�
   const text = textOf(out);
   assert.ok(text.includes('0.6') && text.includes('0.11') && text.includes('2.2'), `应显示单价行，实际 ${text}`);
 
-  // 全天一价：没有倒计时、没有指示灯，只有单价行那一条悬浮说明。
-  const titles = nodesOf(out).filter((n) => n.props && typeof n.props.title === 'string').map((n) => n.props.title);
-  assert.equal(titles.length, 1, `只应有单价行一条说明，实际 ${JSON.stringify(titles)}`);
-  assert.ok(titles[0].includes('美元'), `币种应跟价格表（USD），实际 ${titles[0]}`);
-  assert.ok(!/距离|还剩/.test(titles[0]), '全天一价的模型不该出现区间倒计时');
+  // 全天一价：没有倒计时、没有指示灯。
+  //
+  // tooltip 的计数口径改成「**真实计费内容**」那一类：单价行的说明里写清了单位与
+  // 三个档位。刷新按钮也有自己的 title（「刷新」），但它不是计费说明，把它算进
+  // "只应有一条说明"会让判据再也验不到"倒计时有没有跑出来"这件事。
+  const titles = nodesOf(out)
+    .filter((n) => n.props && typeof n.props.title === 'string')
+    .map((n) => n.props.title);
+  const billingTitles = titles.filter((t) => /百万|per 1M|美元|USD|CNY/.test(t));
+  assert.equal(billingTitles.length, 1,
+    `只应有单价行一条**计费**说明，实际全部 title：${JSON.stringify(titles)}`);
+  assert.ok(billingTitles[0].includes('美元'), `币种应跟价格表（USD），实际 ${billingTitles[0]}`);
+  assert.ok(!/距离|还剩/.test(billingTitles[0]), '全天一价的模型不该出现区间倒计时');
+  // 刷新按钮的 title 与计费无关，且不能含区间倒计时——它不该被当成计费说明。
+  const refreshTitles = titles.filter((t) => /刷新|Refresh/.test(t));
+  for (const t of refreshTitles) {
+    assert.ok(!/距离|还剩/.test(t), `刷新入口的说明不得混入区间倒计时，实际 ${t}`);
+  }
 });
 
 test('非 DeepSeek provider 有分时段计费时：峰谷说明照旧（指示灯已去掉）', async () => {
@@ -1018,7 +1063,14 @@ test('非中文语言（ja）按英文渲染，并向宿主请求 en', async () 
   const labels = nodesOf(renderCard(Comp, runtime).out)
     .map((n) => n.props && n.props['aria-label'])
     .filter(Boolean);
-  assert.ok(labels.includes('Account usage, click to refresh'), `应显示英文文案，实际 ${JSON.stringify(labels)}`);
+  // 卡片现在是「整条切形态 + 独立刷新」两个入口，所以英文界面上应当**同时**
+  // 看到形态入口（`Show all sources`）与刷新入口（`Refresh`）。
+  // 不再去认旧的 `Account usage, click to refresh` —— 那个串把"点击刷新"写进了
+  // 整卡的语义里，正是被拆掉的那件事。
+  assert.ok(labels.includes('Show all sources'),
+    `应显示英文形态入口文案，实际 ${JSON.stringify(labels)}`);
+  assert.ok(labels.includes('Refresh'),
+    `应显示英文刷新入口文案，实际 ${JSON.stringify(labels)}`);
 });
 
 test('DSH 语言切换后立即按新语言重取一次', async () => {
@@ -1043,7 +1095,11 @@ test('DSH 语言切换后立即按新语言重取一次', async () => {
   const labels = nodesOf(renderCard(Comp, runtime).out)
     .map((n) => n.props && n.props['aria-label'])
     .filter(Boolean);
-  assert.ok(labels.includes('Account usage, click to refresh'), `切换后应显示英文文案，实际 ${JSON.stringify(labels)}`);
+  // 同上：形态入口与刷新入口的英文文案都要跟着语言切过来。
+  assert.ok(labels.includes('Show all sources'),
+    `切换后应显示英文形态入口文案，实际 ${JSON.stringify(labels)}`);
+  assert.ok(labels.includes('Refresh'),
+    `切换后应显示英文刷新入口文案，实际 ${JSON.stringify(labels)}`);
 });
 
 // ---- 会话内视图：conversation.view「用量」Tab ------------------------------

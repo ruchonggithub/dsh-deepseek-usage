@@ -1102,9 +1102,17 @@ test('stats：按三大计费类型 → 厂商 → 模型返回聚合结果', as
     const { ctx, routes } = makeCtx();
     apply(ctx);
     const route = routes.get('/api/quota-usage/stats');
+    // 统计改成**后台预计算**之后，普通 GET 只读缓存；首轮是否算完取决于机器快慢。
+    // 所以这里先 `POST` **强制算一次**，再 GET 断言"算完之后的数据长什么样"——
+    // 这与首轮时序解耦，不会因为机器快而绿、慢而红。
+    // （"打开即读缓存"这件事由 test/stats-precompute.test.mjs 的判据1 单独钉住，
+    //  那条靠数扫描调用次数，普通 GET 期间必须为 0。）
+    const forced = await call(route, makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage/stats', 'POST'));
+    assert.equal(forced.status, 200, `强制重算应 200，实际 ${forced.status}`);
     const res = await call(route, makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage/stats'));
     assert.equal(res.status, 200);
     assert.equal(res.body.ok, true);
+    assert.equal(res.body.state, 'ready', `算完之后应为 ready，实际 ${JSON.stringify(res.body.state)}`);
     assert.equal(res.body.messages, 4);
     assert.deepEqual(res.body.kinds.map((k) => k.kind), ['subscription', 'prepaid', 'credits']);
     const credits = res.body.kinds.find((k) => k.kind === 'credits');
@@ -1116,15 +1124,30 @@ test('stats：按三大计费类型 → 厂商 → 模型返回聚合结果', as
   }
 });
 
-test('stats：非 GET 方法被拒绝', async () => {
+test('stats：非 GET/HEAD/POST 的方法被拒绝', async () => {
   const { ctx, routes } = makeCtx();
   apply(ctx);
   const res = await call(
     routes.get('/api/quota-usage/stats'),
-    makeReq({}, '/api/quota-usage/stats', 'POST'),
+    makeReq({}, '/api/quota-usage/stats', 'PUT'),
   );
+  // POST 现在是**合法动作**（强制重算），所以 405 的样本必须换成别的动词。
+  // 用 PUT 而不是"仍用 POST 期望 405"：如果拿 POST 测，实现一旦正确接受 POST，
+  // 这条判据就会因为"403 信任围栏"而红/绿摇摆，测的其实是别的东西。
   assert.equal(res.status, 405);
   assert.equal(res.body.error, 'method');
+});
+
+test('stats：POST 强制重算也要过信任围栏（合法动作不等于免检）', async () => {
+  const { ctx, routes } = makeCtx();
+  apply(ctx);
+  const res = await call(
+    routes.get('/api/quota-usage/stats'),
+    makeReq({ host: 'evil.example:64452' }, '/api/quota-usage/stats', 'POST'),
+  );
+  assert.equal(res.status, 403,
+    `POST 是合法动作，但异源仍必须 403（信任围栏不是方法白名单的替代品），实际 ${res.status}`);
+  assert.equal(res.body.error, 'forbidden');
 });
 
 test('stats：拒绝非本机来源（跨站 Host 一律 403）', async () => {
@@ -1145,11 +1168,14 @@ test('stats：会话目录不存在时返回空统计而不是 5xx', async () =>
   try {
     const { ctx, routes } = makeCtx();
     apply(ctx);
-    const res = await call(
-      routes.get('/api/quota-usage/stats'),
-      makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage/stats'),
-    );
+    const route = routes.get('/api/quota-usage/stats');
+    // 与上面「按三大计费类型」同理：统计是后台预计算，普通 GET 只读缓存，
+    // 空目录下首轮也可能还没算完。先 POST 强制算一次，再断言"算完之后是空统计"。
+    const forced = await call(route, makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage/stats', 'POST'));
+    assert.equal(forced.status, 200, `空目录下强制重算也应 200，实际 ${forced.status}`);
+    const res = await call(route, makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage/stats'));
     assert.equal(res.status, 200);
+    assert.equal(res.body.state, 'ready', `算完之后应为 ready，实际 ${JSON.stringify(res.body.state)}`);
     assert.deepEqual(res.body.kinds, []);
     assert.equal(res.body.messages, 0);
   } finally {
@@ -1252,4 +1278,66 @@ test('session 参数：非法会话 id 被忽略（不拼进路径、不报错�
     assert.equal(res.status, 200, `${bad} 不应导致 5xx`);
     assert.equal(res.body.pricing.modelFrom, 'default-selection', `${bad} 应被忽略`);
   }
+});
+
+// ---- 第三方注册的路由 id：服务端必须认出同一份订阅 ------------------------
+//
+// 真机证据（lead 的 GET）：
+//   provider: { id: 'codex-chatgpt', kind: 'none', reason: 'unsupported' }
+//   快照:     subscription.value.subscriptions[0].provider = 'openai-codex'，ok:true
+// 同一份 ChatGPT 订阅被第三方插件注册成 `codex-chatgpt`，而能力表按 `openai-codex`
+// 索引。用户在侧边栏看到的是「当前插件不支持 codex-chatgpt」——服务端把一条**能查**
+// 的路由说成了不支持。
+//
+// 这一组是**服务端黑盒**：只走 `/api/quota-usage` 这个 Http 面，不碰界面渲染。
+// 界面侧的容错（按数据判而不是按 kind 判）也要有，但那是另一条判据；这里钉的是
+// "路由自己就该认出这条 id"，否则任何消费方都得各自写一份别名表。
+
+test('canonical：codex-chatgpt 必须被认成 openai-codex，不得回 unsupported', async () => {
+  resetFetch();
+  const { ctx, routes } = makeCtx({ provider: 'codex-chatgpt', model: 'gpt-6.1-sol' });
+  apply(ctx);
+  const res = await call(
+    routes.get('/api/quota-usage'),
+    makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage?lang=zh'),
+  );
+  assert.equal(res.status, 200);
+  // id 保持原样：用户要看到自己用的是哪条路由。
+  assert.equal(res.body.provider.id, 'codex-chatgpt', `provider.id 不得被替换成 canonical，实际 ${res.body.provider.id}`);
+  // 但能力判定必须认出它：kind 不是 none。
+  assert.notEqual(res.body.provider.kind, 'none',
+    `codex-chatgpt 是同一份 ChatGPT 订阅，不得判成 none/unsupported，实际 ${JSON.stringify(res.body.provider)}`);
+  assert.equal(res.body.provider.kind, 'oauth');
+  // 用户可见的错误里不得再出现「不支持」。
+  assert.deepEqual(res.body.errors, [],
+    `不得对 codex-chatgpt 报「不支持」，实际 ${JSON.stringify(res.body.errors)}`);
+});
+
+test('canonical：provider.capability 必须给出规范化 id（界面靠它匹配快照）', async () => {
+  resetFetch();
+  for (const [id, want] of [['codex-chatgpt', 'openai-codex'], ['chatgpt-codex', 'openai-codex'], ['openai-codex', 'openai-codex']]) {
+    const { ctx, routes } = makeCtx({ provider: id, model: 'gpt-6.1-sol' });
+    apply(ctx);
+    const res = await call(
+      routes.get('/api/quota-usage'),
+      makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage?lang=zh'),
+    );
+    assert.equal(res.status, 200, `${id} 不应 5xx`);
+    assert.equal(res.body.provider.capability, want,
+      `${id} 的 canonical 应是 ${want}，实际 ${JSON.stringify(res.body.provider)}`);
+  }
+});
+
+test('canonical：认不出能力的路由仍如实说 capability === id（不编造）', async () => {
+  resetFetch();
+  const { ctx, routes } = makeCtx({ provider: 'some-unknown-gateway', model: 'x' });
+  apply(ctx);
+  const res = await call(
+    routes.get('/api/quota-usage'),
+    makeReq({ host: '127.0.0.1:64452' }, '/api/quota-usage?lang=zh'),
+  );
+  assert.equal(res.status, 200);
+  assert.equal(res.body.provider.capability, 'some-unknown-gateway',
+    `认不出时 capability 应等于 id，实际 ${JSON.stringify(res.body.provider)}`);
+  assert.equal(res.body.provider.kind, 'none');
 });
