@@ -114,9 +114,18 @@ const MUTATIONS = [
     target: 'lib/client.js',
     expectFail: 'G1',
     mutate: (text) => {
-      const marker = 'h(IconWallet, null),';
-      if (!text.includes(marker)) return null;
-      return text.replace(marker, `${marker}\n\t\t\t\t\t\th("span", null, t("credit.card.title")),`);
+      // 锚点换过：原来的 `h(IconWallet, null)` 随「收缩/展开两形态」重构一起删了
+      // （头部不再画图标）。现在的等效锚点是卡片容器本身——把标题塞进它的第一个
+      // 子节点位置，效果与"标题回到界面"一致。
+      const marker = 'h("div", {\n\t\t\t\t\t\tstyle: { display: "flex", flexDirection: "column", gap: 6, padding: open ?';
+      if (!text.includes(marker)) {
+        // 退一步：用 IconWallet 的定义处做锚点不成立（那里只是图标组件），
+        // 因此找图标组件被引用的任何位置。
+        const alt = 'h(IconWallet';
+        if (!text.includes(alt)) return null;
+        return text.replace(alt, 'h("span", null, t("credit.card.title")), h(IconWallet');
+      }
+      return text.replace(marker, `h("span", null, t("credit.card.title")),\n\t\t\t\t\t${marker}`);
     },
   },
   {

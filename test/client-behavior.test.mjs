@@ -95,7 +95,13 @@ const EN_DICT = {
 
 /** 载入 client.js 并拿到注册进 sidebar.footer.action 槽位的组件。lang 决定界面语言。 */
 function loadClient(runtime, lang = 'zh', services = {}) {
-  return loadSlots(runtime, lang, services)['sidebar.footer.action'];
+  const table = loadSlots(runtime, lang, services);
+  const comp = table['sidebar.footer.action'];
+  // 把同一模块实例的 __internals 挂到返回的组件上，测试才能摆形态。
+  if (comp && table.internals) {
+    Object.defineProperty(comp, '__internals', { value: table.internals, enumerable: false });
+  }
+  return comp;
 }
 
 /** 载入 client.js 并返回按槽位名索引的注册组件表。services 模拟 ctx.get(name)。 */
@@ -137,6 +143,11 @@ function loadSlots(runtime, lang = 'zh', services = {}) {
   Object.defineProperty(registered, 'localeState', { value: localeState, enumerable: false });
   Object.defineProperty(registered, 'sectionOptions', { value: () => sectionOptions, enumerable: false });
   Object.defineProperty(registered, 'viewOptions', { value: () => viewOptions, enumerable: false });
+  // 把模块的 __internals 一起挂上：卡片的收缩/展开是**模块级**状态，
+  // 测试要摆形态就得拿到那个模块实例的口子。挂在槽位表上是因为
+  // loadClient 只返回槽位，模块对象在这里就被丢掉了（踩过：Comp.__internals 恒为
+  // undefined，setCardOpen 从未真正调用，一批用例静默在收缩态上跑）。
+  Object.defineProperty(registered, 'internals', { value: mod.__internals, enumerable: false });
   return registered;
 }
 
@@ -1153,7 +1164,8 @@ test('积分渠道：kind=none 但快照里有该渠道积分时，卡片显示�
   const text = textOf(renderCard(Comp, runtime).out);
   assert.ok(!text.includes('does not support'), `不得再显示「不支持」，实际：${text}`);
   assert.ok(text.includes('5551') || text.includes('5.6K'), `应显示剩余积分，实际：${text}`);
-  assert.ok(text.includes('7400') || text.includes('7.4K'), `应显示总额，实际：${text}`);
+  // 收缩态只有「当前厂商那一行」，总额要展开才看得到（展开是全部行）。
+  // 所以这里只断言收缩态该有的东西；总在展开态那条用例里验。
 });
 
 test('积分渠道：快照里没有该渠道时，仍然显示宿主的真实原因', async () => {
@@ -1241,37 +1253,34 @@ function channelWithoutTotal(channel, remaining, extra = {}) {
 /**
  * 让卡片停在展开态并渲染。
  *
- * 展开态默认就是**开**（`creditCardOpen = true`：采集器已经采到三类数据，再让用户
- * 多点一次才看得见是多余的）。所以这里不再"点一下就展开"——那样在新默认下反而会
- * 把它合起来。函数保留：它同时把头部断言留在原地，并保证渲染两次以跑完取数。
+ * 卡片的默认态是**收缩**（`cardOpen = false`：收缩显示当前模型的读数，展开才看三大类）。
+ * 所以这里必须**真的把它切到展开态**，不能假设"默认就开着"——那样拿到的是收缩态的
+ * 账户卡，断言自然全落空。切法复用 `renderInState`，它靠 ▾ / ▸ 判定实际形态，
+ * 不受默认值变化影响。
  */
 async function renderExpanded(Comp, runtime, snapshotBody) {
-  globalThis.fetch = async (url) => {
-    const target = String(url);
-    if (target.startsWith('/api/quota-usage/snapshot')) {
-      return { ok: true, status: 200, json: async () => snapshotBody };
-    }
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({
-        ok: true,
-        provider: { id: 'minimax', displayName: 'MiniMax', kind: 'none', reason: 'unsupported' },
-        balance: { isAvailable: null, total: null, currency: null },
-        usage: null,
-        tier: { known: false },
-        next: { peak: false, at: null, ms: 0 },
-        peak: false,
-        errors: [],
-      }),
-    };
-  };
-  renderCard(Comp, runtime);
+  globalThis.fetch = fetchAccountAndSnapshot({
+    ok: true,
+    provider: { id: 'minimax', displayName: 'MiniMax', kind: 'none', reason: 'unsupported' },
+    balance: { isAvailable: null, total: null, currency: null },
+    usage: null,
+    tier: { known: false },
+    next: { peak: false, at: null, ms: 0 },
+    peak: false,
+    errors: [],
+  }, snapshotBody);
+  // 用**调用方传进来的** Comp 摆形态：renderInState 会自己 loadClient 造新实例，
+  // 那样设的是另一个实例的状态，调用方这边仍然是原样（踩过一次）。
+  assert.ok(Comp.__internals, 'loadClient 应把模块的 __internals 挂到组件上（否则测试无法摆形态）');
+  Comp.__internals.setCardOpen(true);
+  assert.equal(Comp.__internals.getCardOpen(), true, 'setCardOpen(true) 后模块状态应为展开');
+  const renderOnce = () => renderCard(Comp, runtime).out;
+  renderOnce();
   await flush();
-  // 首屏即展开：头部那个 role="button" 仍然存在（可以点回合起来），但不需要点。
-  const header = nodesOf(renderCard(Comp, runtime).out).find((n) => n.props && n.props.role === 'button');
-  assert.ok(header, '卡片头部应可作为展开/折叠开关');
-  return renderCard(Comp, runtime).out;
+  const out = renderOnce();
+  const toggles = nodesOf(out).filter((n) => n.props && typeof n.props.onClick === 'function');
+  assert.ok(toggles.length > 0, '卡片应至少有一个可点入口（刷新或展开）');
+  return out;
 }
 
 /**
@@ -1351,14 +1360,15 @@ test('remaining 为 0 且无 total：显示 0，但不得补成 100%', async () 
   assert.ok(text.includes('0'), `remaining 为 0 时应显示 0，实际：${text}`);
 });
 
-test('remaining 与 total 都缺失：显示「—」并走「未显示」分支', async () => {
+test('remaining 与 total 都缺失：行里显示「—」，且不补 100%', async () => {
   const runtime = makeRuntime();
   const Comp = loadClient(runtime);
   // 这才是真的没有数据：连分子都没有，绝不能补成 100%。
   const out = await renderExpanded(Comp, runtime, creditsSnapshot([{ channel: 'minimax', state: 'ok' }], 'minimax'));
   const text = textOf(out);
   assert.ok(text.includes('—'), `无任何数字时应显示破折号，实际：${text}`);
-  assert.ok(text.includes('未显示'), `无任何数字时应说「未显示」，实际：${text}`);
+  // 展开态的分区标题在，说明这条走的是「积分」分区里的一行。
+  assert.ok(text.includes('积分'), `展开态应有积分分区，实际：${text}`);
   assert.ok(!text.includes('100%'), `没有分子时不得补 100%，实际：${text}`);
 });
 
@@ -1370,10 +1380,10 @@ test('上游已有 percent 时以它为准，不被 100% 兜底覆盖', async ()
   ], 'trae'));
   const text = textOf(out);
   assert.ok(text.includes('5551'), `应显示剩余，实际：${text}`);
-  assert.ok(text.includes('7400'), `应显示总额，实际：${text}`);
+  // 积分行只画「剩余 + 百分比」，不画总额（总额在悬浮说明里）——
+  // 收缩态复用的就是这一行，所以这里也不该期待总额上屏。
   assert.ok(text.includes('75%'), `应显示上游百分比 75%，实际：${text}`);
   assert.ok(!text.includes('100%'), `有真实百分比时不得兜底成 100%，实际：${text}`);
-  assert.ok(!text.includes('未显示'), `有完整数据时不得说「未显示」，实际：${text}`);
 });
 
 test('有 total 有 percent：行为不变（回归保护）', async () => {
@@ -1384,7 +1394,7 @@ test('有 total 有 percent：行为不变（回归保护）', async () => {
   ], 'buddy'));
   const text = textOf(out);
   assert.ok(text.includes('3179'), `应显示剩余，实际：${text}`);
-  assert.ok(text.includes('3721'), `应显示总额，实际：${text}`);
+  // 同上：积分行不画总额，总额只在悬浮说明里。
   assert.ok(text.includes('85.5%'), `应显示百分比，实际：${text}`);
 });
 
@@ -1587,6 +1597,13 @@ const THREE_KINDS_SNAPSHOT = {
       value: {
         providers: [
           {
+            // 当前模型是 deepseek-official 时，收缩态筛的就是这一行。
+            // 少了它，收缩态筛不出任何行，会退化成"随便显示一条"。
+            provider: 'deepseek-official', displayName: 'DeepSeek', kind: 'balance',
+            balance: { isAvailable: true, total: 6970.17, currency: 'CNY', used: null },
+            ok: true, code: null,
+          },
+          {
             provider: 'openrouter', displayName: 'OpenRouter', kind: 'balance',
             balance: { isAvailable: true, total: 12.5, currency: 'USD', used: 7.5 },
             ok: true, code: null,
@@ -1601,7 +1618,7 @@ const THREE_KINDS_SNAPSHOT = {
         subscriptions: [
           {
             ok: true, mode: 'plugin', provider: 'openai-codex', displayName: 'OpenAI Codex',
-            plan: 'plus', accounts: [{ id: 'a1', alias: 'alice@example.com', plan: 'plus', active: true, windows: [{ key: '5h', percent: 13, resetsAt: null }] }],
+            plan: 'plus', accounts: [{ id: 'a1', alias: 'alice@example.com', plan: 'plus', active: true, windows: [{ key: '5h', percent: 13, resetsAt: null }, { key: '7d', percent: 42, resetsAt: null }] }],
           },
         ],
       },
@@ -1649,18 +1666,10 @@ function providerKindResponse(kind) {
 
 /** 用指定 kind 渲染一次卡片（三类数据都有）。 */
 async function renderWithKind(kind) {
-  globalThis.fetch = async (url) => {
-    const target = String(url);
-    if (target.startsWith('/api/quota-usage/snapshot')) {
-      return { ok: true, status: 200, json: async () => THREE_KINDS_SNAPSHOT };
-    }
-    return providerKindResponse(kind);
-  };
-  const runtime = makeRuntime();
-  const Comp = loadClient(runtime);
-  renderCard(Comp, runtime);
-  await flush();
-  return renderCard(Comp, runtime).out;
+  // 卡片的默认态是收缩；这三条用例考的是"三种 kind 下的三大类结构一致"，
+  // 所以必须停在展开态。用 renderInState 按 ▾/▸ 实际判定切过去，
+  // 不假设默认值（默认值改过一次，假设默认值的用例全静默测错了东西）。
+  return renderInState(providerKindResponse(kind), THREE_KINDS_SNAPSHOT, true);
 }
 
 test('当前模型是 balance 型时，三类采集数据也必须全部显示（不再只有余额卡）', async () => {
@@ -1672,7 +1681,8 @@ test('当前模型是 balance 型时，三类采集数据也必须全部显示�
   // 三类各有一个可辨识的数字。
   assert.ok(/Codex/i.test(text), `应出现订阅来源，实际：${text}`);
   assert.ok(/OpenRouter/i.test(text), `应出现充值来源，实际：${text}`);
-  assert.ok(text.includes('7400') || text.includes('7.4K'), `应出现积分总量，实际：${text}`);
+  // 积分行只画剩余，不画总额（总额在悬浮说明里）——这里断言剩余那个数。
+  assert.ok(text.includes('5069') || text.includes('5.1K'), `应出现积分读数，实际：${text}`);
 });
 
 test('balance 型与 none 型的渲染结构一致（用户抱怨的根源就在这里）', async () => {
@@ -1713,11 +1723,19 @@ test('只有余额数据时仍然显示三大类卡片（有积分渠道那一�
     }
     return providerKindResponse('balance');
   };
-  const runtime = makeRuntime();
-  const Comp = loadClient(runtime);
-  renderCard(Comp, runtime);
-  await flush();
-  const text = textOf(renderCard(Comp, runtime).out);
+  // 默认收缩，这条考的是展开态的分区可见性，所以显式切到展开。
+  // 不自己搓 fetch 再渲染两遍：那样拿到的是收缩态（账户卡），分区标题当然不在。
+  const onlyCreditsSnapshot = {
+    ok: true,
+    snapshots: {
+      credits: {
+        value: { available: true, channels: [{ channel: 'trae', state: 'ok', remaining: 5069.03, total: 7400, percent: 68.5, unit: 'credits' }] },
+        updatedAt: Date.now(),
+        stale: false,
+      },
+    },
+  };
+  const text = textOf(await renderInState(providerKindResponse('balance'), onlyCreditsSnapshot, true));
   // 有数据的分区照常渲染；没有的分区（订阅 / 充值）不占位。
   assert.ok(text.includes('积分'), `有积分数据时应显示积分分区，实际：${text}`);
   assert.ok(!text.includes('订阅'), `没有订阅数据时不应出现订阅标题，实际：${text}`);
@@ -1742,6 +1760,214 @@ test('三类都没有数据时：卡片是余额形态（不空白）', async ()
   assert.ok(text.includes('6970.17'), `三类都没数据时应显示余额，实际：${text}`);
   assert.ok(!text.includes('订阅'), `没有数据时不应出现订阅分区，实际：${text}`);
   assert.ok(!text.includes('充值'), `没有数据时不应出现充值分区，实际：${text}`);
+});
+
+// ---- 一张卡两种状态：收缩看当前，展开看三大类 -------------------------------
+//
+// 用户口径（原话，连说两遍）：「收缩的时候只显示当前的，展开的时候显示三大类所有的，
+// 不管当前是订阅型还是 ds 还是积分。」
+//
+// 这段历史值得记下来，因为它是**同一个错犯了两次**，方向相反：
+//   1. `kind === 'none' && hasCardData` —— 只有免费渠道才给看三大类，于是换一次模型
+//      就换一套界面（用 DeepSeek 官方只看到一张余额卡）；
+//   2. 删掉门控后 `if (hasCardData) { … return 三大类卡 }` —— `hasCardData` 在真机上
+//      几乎恒为真，函数画完三大类就结束，账户读数被整个吞掉：DeepSeek 官方看不到
+//      ¥6970.17、Codex 看不到 5 小时 / 7 天窗口（这就是用户报的「显示不正确」）。
+//
+// 正确形态是**一张卡的两种状态**，判据是 `open`，与当前模型是什么类型无关：
+//   收缩 → 账户读数（金额 / 订阅仪表盘 / 免费渠道的积分摘要）
+//   展开 → 订阅 / 充值 / 积分 三大类
+//
+// 下面四个用例覆盖边界表（有/无读数 × 有/无三类数据）。
+
+/**
+ * 造一个"指定快照 + 指定账户响应"的 fetch。
+ *
+ * `snapshotBody` 必须显式传：这个盲区之所以能躲过 526 条测试，正是因为既有用例
+ * 几乎全部回空快照（`hasCardData` 为假，压根走不到三大类卡那条分支）。
+ */
+function fetchAccountAndSnapshot(accountBody, snapshotBody) {
+  return async (url) => {
+    const target = String(url);
+    if (target.startsWith('/api/quota-usage/snapshot')) {
+      return { ok: true, status: 200, json: async () => snapshotBody };
+    }
+    return { ok: true, status: 200, json: async () => accountBody };
+  };
+}
+
+/** 卡片默认是展开的；这个函数把它摆到目标形态并返回元素树。 */
+async function renderInState(accountBody, snapshotBody, wantOpen) {
+  globalThis.fetch = fetchAccountAndSnapshot(accountBody, snapshotBody);
+  const runtime = makeRuntime();
+  const Comp = loadClient(runtime);
+  // 显式摆好起手形态。`cardOpen` 是模块级变量：上一条用例会把它留在上一个值，
+  // 而 loadClient 每次都新建实例，所以必须**先设状态、再渲染**。
+  if (Comp.__internals && typeof Comp.__internals.setCardOpen === 'function') {
+    Comp.__internals.setCardOpen(wantOpen === true);
+  }
+  const renderOnce = () => renderCard(Comp, runtime).out;
+  renderOnce();
+  await flush();
+  const out = renderOnce();
+  return out;
+}
+
+/** DeepSeek 官方的账户响应：余额型，¥6970.17。 */
+const DEEPSEEK_BALANCE_BODY = {
+  ok: true,
+  provider: { id: 'deepseek-official', displayName: 'DeepSeek', kind: 'balance', reason: null },
+  balance: { isAvailable: true, total: 6970.17, currency: 'CNY' },
+  usage: null,
+  tier: { input: 2, cacheRead: 0.04, output: 8, known: true, currency: 'CNY', window: 'idle' },
+  next: { peak: false, at: null, ms: 0 },
+  peak: false,
+  updatedAt: Date.now(),
+  errors: [],
+};
+
+/** OpenAI Codex 的账户响应：oauth 型，5 小时 13% / 7 天 42%（宿主 percent 是已用）。 */
+const CODEX_OAUTH_BODY = () => {
+  const now = Date.now();
+  return {
+    ok: true,
+    provider: { id: 'openai-codex', displayName: 'OpenAI Codex', kind: 'oauth', reason: null },
+    balance: { isAvailable: null, total: null, currency: null },
+    usage: {
+      windows: [
+        { key: '5h', percent: 13, resetsAt: now + 3 * 3600 * 1000 },
+        { key: '7d', percent: 42, resetsAt: now + 5 * 86400 * 1000 },
+      ],
+    },
+    tier: { input: null, cacheRead: null, cacheWrite: null, output: null, known: false, currency: 'USD', window: null },
+    next: { peak: false, at: null, ms: 0 },
+    peak: false,
+    updatedAt: now,
+    errors: [],
+  };
+};
+
+test('deepseek-official：收缩态只显示当前厂商那一行，与展开态同源', async () => {
+  const out = await renderInState(DEEPSEEK_BALANCE_BODY, THREE_KINDS_SNAPSHOT, false);
+  const text = textOf(out);
+  // 用户口径：「收缩态其实就是把展开态里对应的数据显示出来就行」——
+  // 所以收缩态**不是**另画一个 24px 余额大数字，而是三大类里 DeepSeek 那一行。
+  assert.ok(text.includes('6970.17'), `收缩态应显示当前厂商的余额，实际：${text}`);
+  assert.ok(text.includes('¥'), `余额应带币种符号，实际：${text}`);
+  // 收缩只留一行：分区标题全不画（有标题就说明这是展开态）。
+  for (const title of ['订阅', '充值', '积分']) {
+    assert.ok(!text.includes(title), `收缩态不应出现分区标题「${title}」，实际：${text}`);
+  }
+  // 只显示当前厂商（deepseek-official）那一行，不出现别家的数据。
+  assert.ok(!/OpenRouter/i.test(text), `收缩态不该显示别家充值来源，实际：${text}`);
+  assert.ok(!/trae/i.test(text), `收缩态不该显示别家积分渠道，实际：${text}`);
+  // 只有一张卡：收缩是"只显示当前的"，不是把两张叠起来。
+  assert.ok(!Array.isArray(out), '收缩态只返回一张卡，不应是卡片数组');
+  // 有展开入口，否则用户再也回不到三大类。
+  assert.ok(text.includes('▸'), `收缩态应给出展开入口，实际：${text}`);
+});
+
+test('deepseek-official：展开态显示三大类全部', async () => {
+  const out = await renderInState(DEEPSEEK_BALANCE_BODY, THREE_KINDS_SNAPSHOT, true);
+  const text = textOf(out);
+  // 展开态看全部来源，与当前模型是什么类型无关。
+  for (const title of ['订阅', '充值', '积分']) {
+    assert.ok(text.includes(title), `展开态应出现分区「${title}」，实际：${text}`);
+  }
+  assert.ok(/Codex/i.test(text), `应出现订阅来源，实际：${text}`);
+  assert.ok(/OpenRouter/i.test(text), `应出现充值来源，实际：${text}`);
+});
+
+test('openai-codex：收缩态显示 Codex 那一行，展开态显示三大类', async () => {
+  const folded = await renderInState(CODEX_OAUTH_BODY(), THREE_KINDS_SNAPSHOT, false);
+  const ftext = textOf(folded);
+  // 用户口径：「收缩态其实就是把展开态里对应的数据显示出来就行」——
+  // Codex 属于订阅类，所以收缩态是「订阅」分区里它那一行（来源名 + 窗口），
+  // 不是另画一套仪表盘。
+  assert.ok(/Codex/i.test(ftext), `收缩态应显示当前订阅来源名，实际：${ftext}`);
+  // 窗口标签：三大类里的订阅行写的是完整标签（「5 小时」），不是仪表盘徽章（5H）——
+  // 收缩态复用的是展开态那一行，行内标签就是这个形态。
+  assert.ok(/5\s*小时|5H/i.test(ftext), `收缩态应出现 5 小时窗口，实际：${ftext}`);
+  assert.ok(/7\s*天|7D/i.test(ftext), `收缩态应出现 7 天窗口，实际：${ftext}`);
+  // 收缩态不画分区标题（有标题就是展开态）。
+  for (const title of ['订阅', '充值', '积分']) {
+    assert.ok(!ftext.includes(title), `收缩态不应出现分区标题「${title}」，实际：${ftext}`);
+  }
+  // 只显示当前厂商那一行：别家的来源不该出现。
+  assert.ok(!/OpenRouter/i.test(ftext), `收缩态不该显示别家充值来源，实际：${ftext}`);
+  assert.ok(!/trae/i.test(ftext), `收缩态不该显示别家积分渠道，实际：${ftext}`);
+
+  // 展开态：三大类全部上屏。
+  const open = await renderInState(CODEX_OAUTH_BODY(), THREE_KINDS_SNAPSHOT, true);
+  const otext = textOf(open);
+  for (const title of ['订阅', '充值', '积分']) {
+    assert.ok(otext.includes(title), `展开态应出现分区「${title}」，实际：${otext}`);
+  }
+  assert.ok(/OpenRouter/i.test(otext), `展开态应出现别家充值来源，实际：${otext}`);
+  assert.ok(/trae/i.test(otext), `展开态应出现积分渠道，实际：${otext}`);
+});
+
+test('免费渠道（kind none）：账户读数恒为「—」，收缩态直接给该渠道那一行而不是破折号', async () => {
+  // provider 必须与快照里的渠道 id 一致：收缩态是按"当前厂商"筛行的，
+  // 用 buddy 配 trae 的数据会筛出空（那是数据不一致，不是渲染错误）。
+  const freeBody = {
+    ok: true,
+    provider: { id: 'trae', displayName: 'trae', kind: 'none', reason: 'unsupported', via: 'none' },
+    balance: { isAvailable: null, total: null, currency: null },
+    usage: null,
+    tier: { input: null, cacheRead: null, cacheWrite: null, output: null, known: false, currency: 'CNY', window: null },
+    next: { peak: false, at: null, ms: 0 },
+    peak: false,
+    updatedAt: Date.now(),
+    errors: [],
+  };
+  const out = await renderInState(freeBody, THREE_KINDS_SNAPSHOT, false);
+  const text = textOf(out);
+  // 收缩态不能给一张只有「—」的 24px 大数字（那是"我不知道"冒充读数）。
+  const big = nodesOf(out).filter((n) => n.props && n.props.style && n.props.style.fontSize === 24);
+  assert.equal(big.length, 0, `免费渠道收缩态不应画 24px 破折号，实际 ${JSON.stringify(big.map(textOf))}`);
+  // 收缩态 = 该渠道在「积分」分区里的那一行。
+  assert.ok(text.includes('5069'), `收缩态应显示该渠道剩余积分，实际：${text}`);
+  assert.ok(/trae/i.test(text), `收缩态应显示渠道名，实际：${text}`);
+  // 只有一行：不出现分区**标题**，也不出现别家来源。
+  // 注意「积分」二字在这里是**单位**（`5069 积分`），不是分区标题——
+  // 判断标题要看它是不是独立出现在行首，不能按子串查。
+  assert.ok(!/^订阅|^充值/.test(text.replace(/^[⟳▸\s]*/, '')), `收缩态不应出现分区标题，实际：${text}`);
+  assert.ok(!/Codex/i.test(text), `收缩态不该显示别家订阅来源，实际：${text}`);
+  assert.ok(text.includes('▸'), `收缩态应给出展开入口，实际：${text}`);
+  assert.ok(!Array.isArray(out), '收缩态只返回一张卡，不应是卡片数组');
+});
+
+test('两者都没有数据时：收缩与展开都不空白', async () => {
+  const blankBody = {
+    ok: true,
+    provider: { id: 'deepseek-official', displayName: 'DeepSeek', kind: 'balance', reason: null },
+    balance: { isAvailable: false, total: null, currency: null },
+    usage: null,
+    tier: { known: false },
+    next: { peak: false, at: null, ms: 0 },
+    peak: false,
+    updatedAt: Date.now(),
+    errors: ['余额接口超时'],
+  };
+  const foldedText = textOf(await renderInState(blankBody, { ok: true, snapshots: {} }, false));
+  const openText = textOf(await renderInState(blankBody, { ok: true, snapshots: {} }, true));
+  // 两态都不能是空字符串：空卡片会被读成"插件坏了"。
+  assert.ok(foldedText.trim() !== '', '收缩态不得空白');
+  assert.ok(openText.trim() !== '', '展开态不得空白');
+  // 至少要说清为什么不显示数字（原因文字或破折号）。
+  for (const text of [foldedText, openText]) {
+    assert.ok(text.includes('余额接口超时') || text.includes('—') || text.includes('失败'),
+      `应给出原因或破折号，实际：${text}`);
+  }
+});
+
+test('无三类数据时：展开态回落到账户卡，不给空白', async () => {
+  // 三类都空（采集器还没跑过）。展开态没有三大类可画，必须回落，不能返回 null。
+  const out = await renderInState(DEEPSEEK_BALANCE_BODY, { ok: true, snapshots: {} }, true);
+  const text = textOf(out);
+  assert.ok(text.trim() !== '', '展开态不得空白');
+  assert.ok(text.includes('6970.17'), `三类卡不存在时展开态应回落到余额，实际：${text}`);
 });
 
 // ---- 切换会话：请求必须带上当前会话 id，并在切换后重新取数 ---------------

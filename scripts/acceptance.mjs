@@ -834,15 +834,23 @@ async function renderG(fetchImpl, { expand = true } = {}) {
   expect(entry !== undefined, '卡片未注册');
   globalThis.fetch = fetchImpl;
   const element = entry.comp({ wide: true, ctx: undefined });
+  // 卡片形态是**模块级**状态（重挂载不该把用户点开的形态合回去），
+  // 所以每条判据都要先把形态摆好，不能指望默认值——默认值改过一次，
+  // 那批"靠默认展开"的判据当时全静默测错了东西。
+  const internals = (globalThis.__dshQuotaInternals ||= null);
   render(element);
   await flush();
   let out = render(element);
   const isOpen = () => textOf(out).includes('▾');
-  // 最多点两次：正常情况下一次就到位；两次是给"残留状态与目标只差一次翻转"兜底。
-  for (let i = 0; i < 2 && isOpen() !== expand; i += 1) {
-    const head = nodesOf(out).filter((n) => n.props && typeof n.props.onClick === 'function' && n.props.role === 'button');
-    expect(head.length > 0, '需要 role=button 的头部来切换展开态');
-    head[0].props.onClick();
+  // 展开态有 ▾；收缩态有 ▸。两者互斥，用它判断当前形态。
+  for (let i = 0; i < 4 && isOpen() !== expand; i += 1) {
+    // 形态入口有两种：展开态的头部（role=button），收缩态的 ▸ 按钮（也是 role=button）。
+    const toggles = nodesOf(out).filter((n) => n.props && typeof n.props.onClick === 'function'
+      && (n.props.role === 'button' || textOf(n).includes('▸') || textOf(n).includes('▾')));
+    if (toggles.length === 0) break;
+    // 优先点文本最短的那个（头部/箭头），它才是形态开关；卡片根节点是刷新。
+    toggles.sort((a, b) => textOf(a).length - textOf(b).length);
+    toggles[0].props.onClick();
     await flush();
     out = render(element);
   }
@@ -871,14 +879,22 @@ async function groupG() {
     return true;
   });
 
-  // G2 摘要优先级
-  await claim('G2', '摘要优先显示当前会话所用渠道，找不到时不冒充', async () => {
-    const out = await renderG(fetchThreeKinds({ currentChannel: 'buddy', credits: SAMPLE_CREDITS }));
+  // G2 收缩态只显示当前渠道那一行
+  //
+  // 判据随形态改过：现在是「收缩 = 当前厂商那一行，展开 = 三大类全部」。
+  // 原来的"摘要优先"考的是折叠摘要那一行——现在收缩态就是那一行本身，
+  // 所以要验的是：当前渠道有数据时显示它、没数据时不冒充别家。
+  await claim('G2', '收缩态只显示当前会话所用渠道，找不到时不冒充', async () => {
+    const out = await renderG(fetchThreeKinds({ currentChannel: 'buddy', credits: SAMPLE_CREDITS }), { expand: false });
     const text = textOf(out);
-    expect(/buddy/i.test(text), `应显示当前渠道 buddy，实际：${text}`);
-    const ghost = await renderG(fetchThreeKinds({ currentChannel: 'ghost', credits: SAMPLE_CREDITS }));
+    expect(/buddy/i.test(text), `收缩态应显示当前渠道 buddy，实际：${text}`);
+    // 收缩态不该把别家渠道也列出来（那是展开态的事）。
+    const others = ['trae', 'raccoon'].filter((c) => new RegExp(c, 'i').test(text) && c !== 'buddy');
+    expect(others.length === 0, `收缩态不该显示别家渠道（${others.join(',')}），实际：${text}`);
+    // 当前渠道在快照里不存在时，不能拿别家的数字冒充。
+    const ghost = await renderG(fetchThreeKinds({ currentChannel: 'ghost', credits: SAMPLE_CREDITS }), { expand: false });
     const gtext = textOf(ghost);
-    expect(/未显示|无数据|读取中/.test(gtext), `当前渠道无数据时应明确说明，实际：${gtext}`);
+    expect(/未显示|无数据|无可用数据|读取中|—/.test(gtext), `当前渠道无数据时应明确说明，实际：${gtext}`);
     return true;
   });
 
